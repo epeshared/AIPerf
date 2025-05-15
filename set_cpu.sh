@@ -1,17 +1,16 @@
 #!/usr/bin/bash
 ## superbenchmark kernel-launch micro-kernel benchmark
-set -euo pipefail
 
-# echo "CONDAROOT=$CONDAROOT"
-# echo "CONDAENV=$CONDAENV"
+echo "CONDAROOT=$CONDAROOT"
+echo "CONDAENV=$CONDAENV"
 
-# if [[ $CONDAROOT != "" ]]; then
-#     source $CONDAROOT/etc/profile.d/conda.sh
-#     conda activate $CONDAENV
-#     conda install -y zip unzip cmake gcc==12.2.0 gxx=12.2.0 bc
-#     apt install -y msr-tools
-# fi
-# echo "cmake is $(which cmake)"
+if [[ $CONDAROOT != "" ]]; then
+    source $CONDAROOT/etc/profile.d/conda.sh
+    conda activate $CONDAENV
+    conda install -y zip unzip cmake gcc==12.2.0 gxx=12.2.0 bc
+    apt install -y msr-tools
+fi
+echo "cmake is $(which cmake)"
 
 echo ""
 echo "GPU topology"
@@ -46,6 +45,7 @@ echo "restore CPU frequency to default"
 cpupower frequency-set -u $maxfreq >/dev/null 2>&1
 cpupower frequency-set -d $minfreq > /dev/null 2>&1
 
+
 ## C6=Enable to achieve maximum frequency
 cpupower idle-set -E
 
@@ -72,58 +72,45 @@ if [[ $CPUVENDER == "GenuineIntel" ]]; then
     echo "CPU${cpu_array[1]} POWER_CTL(MSR 1FC) = $(rdmsr -p ${cpu_array[1]} 0x1fc)"
 fi
 
-###################################################################
-### Start to RUN nccl_test benchmark
-###################################################################
-
+WLDIR="/home/xtang/nccl-tests"
+cp *.sh $WLDIR/
+cd $WLDIR
 NCCL_TEST="AllReduce"
 GPU_NUM="1"
-
-mkdir -p ${NCCL_TEST}/GPU_NUM_${GPU_NUM}
-WKDIR=$(pwd)
-RESULT_DIR="${WKDIR}/${NCCL_TEST}/GPU_NUM_${GPU_NUM}"
-TEST_WLDIR="/home/xtang/nccl-tests"
-cp *.sh $TEST_WLDIR/
-cd $TEST_WLDIR
-
 
 ## CPU governor == powersave
 cpupower frequency-set -g powersave > /dev/null 2>&1
 echo "set CPU governor to powersave"
 
-echo "Run nccl_test on CPU ${cpu_array[0]}"
+echo "Run kernel_launch on CPU ${cpu_array[0]}"
 turbostat -c ${cpu_array[0]},${cpu_array[1]} -i2 -n 4 -q &
 cmd1="taskset -c ${cpu_array[0]} ./nccl_test.sh ${GPU_NUM}  ${NCCL_TEST}"
 echo $cmd1
 eval $cmd1
-mv nccl_results_rank${GPU_NUM}.csv ${RESULT_DIR}/nccl_results_rank${GPU_NUM}_${NCCL_TEST}_CPU${cpu_array[0]}_powersave.csv
 
-echo "Run nccl_test on CPU ${cpu_array[1]}"
+echo "Run kernel_launch on CPU ${cpu_array[1]}"
 turbostat -c ${cpu_array[0]},${cpu_array[1]} -i2 -n 4 -q &
 cmd2="taskset -c ${cpu_array[1]} ./nccl_test.sh ${GPU_NUM} ${NCCL_TEST}"
 echo $cmd2
 eval $cmd2
-mv nccl_results_rank${GPU_NUM}.csv ${RESULT_DIR}/nccl_results_rank${GPU_NUM}_${NCCL_TEST}_CPU${cpu_array[1]}_powersave.csv
 
 ## CPU governor == performance
 cpupower frequency-set -g performance > /dev/null 2>&1
 echo "Set CPU governor to performance"
 
-echo "Run nccl_test on CPU ${cpu_array[0]}"
+echo "Run kernel_launch on CPU ${cpu_array[0]}"
 turbostat -c ${cpu_array[0]},${cpu_array[1]} -i2 -n 4 -q &
 cmd3="taskset -c ${cpu_array[0]} ./nccl_test.sh ${GPU_NUM} ${NCCL_TEST}"
 echo $cmd3
 eval $cmd3
-mv nccl_results_rank${GPU_NUM}.csv ${RESULT_DIR}/nccl_results_rank${GPU_NUM}_${NCCL_TEST}_CPU${cpu_array[0]}_performance.csv
 
-echo "Run nccl_test on CPU ${cpu_array[1]}"
+echo "Run kernel_launch on CPU ${cpu_array[1]}"
 turbostat -c ${cpu_array[0]},${cpu_array[1]} -i2 -n 4 -q &
 cmd4="taskset -c ${cpu_array[1]} ./nccl_test.sh ${GPU_NUM} ${NCCL_TEST}"
 echo $cmd4
 eval $cmd4
-mv nccl_results_rank${GPU_NUM}.csv ${RESULT_DIR}/nccl_results_rank${GPU_NUM}_${NCCL_TEST}_CPU${cpu_array[0]}_performance.csv
 
-echo "Run nccl_test freq scaling on CPU ${cpu_array[0]}"
+echo "Run kernel_launch freq scaling on CPU ${cpu_array[0]}"
 for freq in `seq 2200000 200000 $((maxfreq+100000))`
 do
     sleep 10
@@ -141,7 +128,7 @@ do
 
     turbostat -c ${cpu_array[0]},${cpu_array[1]} -i2 -n5 -q &
     cmd5="taskset -c ${cpu_array[0]} ./nccl_test.sh ${GPU_NUM} ${NCCL_TEST}"
-    mv nccl_results_rank${GPU_NUM}.csv ${RESULT_DIR}/nccl_results_rank${GPU_NUM}_${NCCL_TEST}_${freq}.csv
+    mv nccl_results_results_rank1.csv nccl_results_rank1_${freq}.csv
     echo $cmd5
     eval $cmd5
 done
@@ -183,11 +170,6 @@ cpupower frequency-set -u $maxfreq > /dev/null 2>&1
 /usr/local/cuda/bin/nsys profile --trace=cuda,nvtx,osrt --sample=none --force-overwrite true -o "nsys-nccl-test-${NCCL_TEST}-freq-$maxfreq" \
     --stats=true taskset -c ${cpu_array[0]} ./nccl_test.sh ${GPU_NUM} ${NCCL_TEST}
 
-mv *.sqlite ${RESULT_DIR}/
-mv *.nsys-rep ${RESULT_DIR}/
-mv *.ncu-rep ${RESULT_DIR}/
-mv *.log ${RESULT_DIR}/
-
 cpupower frequency-set -d $minfreq > /dev/null 2>&1
 cpupower frequency-set -u $maxfreq > /dev/null 2>&1
 
@@ -195,6 +177,5 @@ cpupower idle-set -E
 echo ""
 echo "Done"
 echo ""
-
 #OUTPUTFILE=kernel-launch-`hostname`-`date +%Y%m%d_%H%M`.zip
 #zip -r dot_product-$OUTPUTFILE.zip *

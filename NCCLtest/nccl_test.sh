@@ -5,7 +5,7 @@
 # Available tests: AllReduce, ReduceScatter, AllGather, Broadcast, Reduce, AlltoAll
 
 set -euo pipefail
-
+#export LD_LIBRARY_PATH=/root/miniforge3/envs/nccl-test/lib/:$LD_LIBRARY_PATH
 usage() {
   echo "Usage: $0 <num_ranks> [Test1 Test2 ...]"
   echo "Available tests: AllReduce, ReduceScatter, AllGather, Broadcast, Reduce, AlltoAll"
@@ -66,7 +66,7 @@ echo "Test,Size(Bytes),Count(Elements),Type,OutPlaceTime(us),OutPlaceAlgBW(GB/s)
 run_test() {
   local binpath="$1"
   local label="$2"
-  local factor="$3"
+  local factor=2
 
   if [ ! -x "$binpath" ]; then
     echo "Error: binary '$binpath' not found or not executable"
@@ -85,6 +85,7 @@ run_test() {
 }
 
 export CUDA_VISIBLE_DEVICES=0
+#export CUDA_VISIBLE_DEIVCES="0,1,2,3"
 
 # 8. 按用户指定的列表依次跑
 for label in "${tests[@]}"; do
