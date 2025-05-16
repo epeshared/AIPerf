@@ -1,182 +1,143 @@
-#!/usr/bin/bash
-## superbenchmark kernel-launch micro-kernel benchmark
+#!/usr/bin/env bash
+## 通用 benchmark 运行脚本：可以在任意测试目录下调用可执行文件
+set -euo pipefail
 
-echo "CONDAROOT=$CONDAROOT"
-echo "CONDAENV=$CONDAENV"
+usage() {
+  echo "Usage: $0 <BenchName> <GPU_NUM> <BenchDir> <BenchCmd> [<bench_cmd_args>...]"
+  echo "  BenchName       : 用于结果目录和文件前缀的测试名"
+  echo "  GPU_NUM         : 要使用的 GPU 数量"
+  echo "  BenchDir        : 测试所在目录（脚本会 cd 到这里）"
+  echo "  BenchCmd        : 在 BenchDir 下可执行的测试文件或脚本"
+  echo "  bench_cmd_args  : 传给 BenchCmd 的额外参数（可选）"
+  exit 1
+}
 
-if [[ $CONDAROOT != "" ]]; then
-    source $CONDAROOT/etc/profile.d/conda.sh
-    conda activate $CONDAENV
-    conda install -y zip unzip cmake gcc==12.2.0 gxx=12.2.0 bc
-    apt install -y msr-tools
+if [[ $# -lt 4 ]]; then
+  usage
 fi
-echo "cmake is $(which cmake)"
 
-echo ""
-echo "GPU topology"
+BenchName="$1"
+GPU_NUM="$2"
+BenchDir="$3"
+BenchCmd="$4"
+shift 4
+BenchArgs=("$@")
 
+# 准备结果目录
+WKDIR=$(pwd)
+RESULT_DIR="${WKDIR}/${BenchName}/GPU_NUM_${GPU_NUM}"
+mkdir -p "${RESULT_DIR}"
+
+# 进入测试目录
+cd "${BenchDir}"
+
+echo
+echo "=== GPU 拓扑 ==="
 nvidia-smi topo -m
-echo ""
-echo "GPU smi"
+echo
+echo "=== GPU 状态 ==="
 nvidia-smi
-echo ""
+echo
 
-GPU0_NUMA_AFFINITY=`nvidia-smi topo -m | awk '/^GPU0/ {print $4}'`
-GPU0_AFFINITY_CPULIST=`nvidia-smi topo -m | awk '/^GPU0/ {print $3}'`
-CPUVENDER=$(lscpu |awk '/Vendor ID/ {print $3}')
+# 找出和 GPU0 关联的 NUMA 节点和 CPU 列表
+GPU0_NUMA_AFFINITY=$(nvidia-smi topo -m | awk '/^GPU0/ {print $4}')
+GPU0_CPU_LIST=$(nvidia-smi topo -m | awk '/^GPU0/ {print $3}')
 
-IFS=',' read -ra ranges <<< "$GPU0_AFFINITY_CPULIST"
-cpu_array=()
-
-for range in "${ranges[@]}"; do
-    if [[ "$range" == *-* ]]; then
-        start=${range%-*}
-        end=${range#*-}
-        cpu_array+=($(seq "$start" "$end"))
-    else
-        cpu_array+=("$range")
-    fi
+# 拆分成单个 core 数组
+IFS=',' read -ra ranges <<< "${GPU0_CPU_LIST}"
+cpu_cores=()
+for r in "${ranges[@]}"; do
+  if [[ "${r}" == *-* ]]; then
+    IFS='-' read -r s e <<< "${r}"
+    cpu_cores+=($(seq "${s}" "${e}"))
+  else
+    cpu_cores+=("${r}")
+  fi
 done
 
-# frequency scaling
-maxfreq="$(cat /sys/bus/cpu/devices/cpu${cpu_array[0]}/cpufreq/cpuinfo_max_freq)"
-minfreq="$(cat /sys/bus/cpu/devices/cpu${cpu_array[0]}/cpufreq/cpuinfo_min_freq)"
-echo "restore CPU frequency to default"
-cpupower frequency-set -u $maxfreq >/dev/null 2>&1
-cpupower frequency-set -d $minfreq > /dev/null 2>&1
+# 取前两个 core 用于绑定
+CPU0=${cpu_cores[0]}
+CPU1=${cpu_cores[1]:-${cpu_cores[0]}}
 
-# unzip superbenchmark.zip
-# rm superbenchmark.zip
+# 判断最高/最低频率
+maxfreq=$(< /sys/bus/cpu/devices/cpu${CPU0}/cpufreq/cpuinfo_max_freq)
+minfreq=$(< /sys/bus/cpu/devices/cpu${CPU0}/cpufreq/cpuinfo_min_freq)
 
-# WLDIR="superbenchmark-main/superbench/benchmarks/micro_benchmarks/kernel_launch_overhead"
-# mkdir -p $WLDIR
+# Helper: 执行一次测试并保存结果
+run_test() {
+  local mode=$1   # powersave/performance or freq value
+  local label=$2  # 文件后缀标识
+  echo ">>> [$mode] 绑定 CPU ${core} 运行 ${BenchCmd} ${BenchArgs[*]}"
+  turbostat -c ${CPU0},${CPU1} -i2 -n4 -q &
+  taskset -c ${core} ./"${BenchCmd}" "${GPU_NUM}" "${BenchName}" "${BenchArgs[@]}"
+  mv nccl_results_rank${GPU_NUM}.csv \
+     "${RESULT_DIR}/${BenchName}_GPU${GPU_NUM}_${label}.csv"
+}
 
-# cmake -S $WLDIR -B build -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
-# make -C build
+##############################################################################
+## 1) powersave & performance 模式
+##############################################################################
+for gov in powersave performance; do
+  echo
+  echo "=== 设置 CPU governor 为 ${gov} ==="
+  cpupower frequency-set -g "${gov}" >/dev/null 2>&1
 
-# cd result
-
-## C6=Enable to achieve maximum frequency
-cpupower idle-set -E
-
-NIDLE=`cpupower idle-info | awk -F ':' '/Number of idle states/ {print $2}'`
-echo "Number of idle states is $NIDLE"
-
-# - c-state control doesn't be effective on PCT!
-cpupower -c 0,1 idle-set -D 50
-
-# many GNR platform as a default enable of Hardware C1E
-# set MSR1FC[bit1] = 0
-if [[ $CPUVENDER == "GenuineIntel" ]]; then
-    MSR1FC=$(rdmsr -p ${cpu_array[0]} 0x1fc)
-    echo "CPU${cpu_array[0]} POWER_CTL(MSR 1FC) = $MSR1FC"
-    newMSR1FC=$(echo "obase=16; $((0x$MSR1FC & ~(1 << 1)))" | bc)
-    echo "Set CPU${cpu_array[0]} POWER_CTL(MSR 1FC) to 0x$newMSR1FC"
-    wrmsr -p ${cpu_array[0]} 0x1fc 0x$newMSR1FC
-    echo "CPU${cpu_array[0]} POWER_CTL(MSR 1FC) = $(rdmsr -p ${cpu_array[0]} 0x1fc)"
-
-    MSR1FC=$(rdmsr -p ${cpu_array[1]} 0x1fc)
-    newMSR1FC=$(echo "obase=16; $((0x$MSR1FC & ~(1 << 1)))" | bc)
-    echo "Set CPU${cpu_array[1]} POWER_CTL(MSR 1FC) to 0x$newMSR1FC"
-    wrmsr -p ${cpu_array[1]} 0x1fc 0x$newMSR1FC
-    echo "CPU${cpu_array[1]} POWER_CTL(MSR 1FC) = $(rdmsr -p ${cpu_array[1]} 0x1fc)"
-fi
-
-## CPU governor == powersave
-cpupower frequency-set -g powersave > /dev/null 2>&1
-echo "set CPU governor to powersave"
-
-echo "Run kernel_launch on CPU ${cpu_array[0]}"
-turbostat -c ${cpu_array[0]},${cpu_array[1]} -i2 -n 4 -q &
-cmd="taskset -c ${cpu_array[0]} ../build/kernel_launch_overhead"
-echo $cmd
-eval $cmd
-
-echo "Run kernel_launch on CPU ${cpu_array[1]}"
-turbostat -c ${cpu_array[0]},${cpu_array[1]} -i2 -n 4 -q &
-cmd="taskset -c ${cpu_array[1]} ../build/kernel_launch_overhead"
-echo $cmd
-eval $cmd
-
-## CPU governor == performance
-cpupower frequency-set -g performance > /dev/null 2>&1
-echo "Set CPU governor to performance"
-
-echo "Run kernel_launch on CPU ${cpu_array[0]}"
-turbostat -c ${cpu_array[0]},${cpu_array[1]} -i2 -n 4 -q &
-cmd="taskset -c ${cpu_array[0]} ../build/kernel_launch_overhead"
-echo $cmd
-eval $cmd
-
-echo "Run kernel_launch on CPU ${cpu_array[1]}"
-turbostat -c ${cpu_array[0]},${cpu_array[1]} -i2 -n 4 -q &
-cmd="taskset -c ${cpu_array[1]} ../build/kernel_launch_overhead"
-echo $cmd
-eval $cmd
-
-echo "Run kernel_launch freq scaling on CPU ${cpu_array[0]}"
-for freq in `seq 2200000 200000 $((maxfreq+100000))`
-do
-    sleep 10
-    if [[ $freq > $maxfreq ]]; then
-        freq=$maxfreq
-    fi
-    echo "Set ${cpu_array[0]} freq to $freq"
-    # cpufreq doesn't work well in change CPU frequency.
-    # Should I set both vCPU belonging to the same core?
-    # user cpupowe frequency-set
-    #echo $freq > /sys/bus/cpu/devices/cpu${cpu_array[0]}/cpufreq/scaling_min_freq
-    #echo $freq > /sys/bus/cpu/devices/cpu${cpu_array[0]}/cpufreq/scaling_max_freq
-    cpupower frequency-set -d $freq > /dev/null 2>&1
-    cpupower frequency-set -u $freq > /dev/null 2>&1
-
-    turbostat -c ${cpu_array[0]},${cpu_array[1]} -i2 -n5 -q &
-    cmd="taskset -c ${cpu_array[0]} ../build/kernel_launch_overhead"
-    echo $cmd
-    eval $cmd
+  for core in "${CPU0}" "${CPU1}"; do
+    run_test "${gov}" "${gov}_CPU${core}"
+  done
 done
 
-cpupower frequency-set -d $minfreq > /dev/null 2>&1
-cpupower frequency-set -u $maxfreq > /dev/null 2>&1
+##############################################################################
+## 2) 频率扫描
+##############################################################################
+echo
+echo "=== 频率扫描 from ${minfreq} to ${maxfreq} step 200000 ==="
+cpupower frequency-set -g userspace >/dev/null 2>&1
 
-if [[ $CPUVENDER == "GenuineIntel" ]]; then
-    ## Collect emon data
-    cmd="taskset -c ${cpu_array[0]} ../build/kernel_launch_overhead -i 10 -n 30000000 &"
-    echo $cmd
-    eval $cmd
-    pid=$!
-    sleep 2
-    . /opt/intel/sep/sep_vars.sh
-    emon -collect-edp -f "emon-kernellaunch-$freq.dat" &
-    sleep 60
-    emon -stop
-    kill -9 $pid
+for freq in $(seq "${minfreq}" 200000 "${maxfreq}"); do
+  echo ">>> 设定 CPU 频率到 ${freq}"
+  cpupower frequency-set -d "${freq}" -u "${freq}" >/dev/null 2>&1
+
+  core=${CPU0}
+  turbostat -c ${CPU0},${CPU1} -i2 -n4 -q &
+#   taskset -c ${core} ./"${BenchCmd}" "${GPU_NUM}" "${BenchName}" "${BenchArgs[@]}"
+
+  # 把屏幕输出重定向到 .txt 文件
+  LOGFILE="${RESULT_DIR}/${BenchName}_GPU${GPU_NUM}_freq${freq}.txt"
+  echo "Running ${BenchCmd}, logging to ${LOGFILE}"
+  taskset -c ${core} ./"${BenchCmd}" "${GPU_NUM}" "${BenchName}" "${BenchArgs[@]}" \
+    > "${LOGFILE}" 2>&1
+
+  mv nccl_results_rank${GPU_NUM}.csv \
+     "${RESULT_DIR}/${BenchName}_GPU${GPU_NUM}_freq${freq}.csv"
+done
+
+# 恢复默认频率
+cpupower frequency-set -d "${minfreq}" -u "${maxfreq}" >/dev/null 2>&1
+cpupower frequency-set -g performance >/dev/null 2>&1
+
+##############################################################################
+## 3) （可选）收集 emon / nsys 数据 —— 仅 Intel 平台
+##############################################################################
+if lscpu | grep -q GenuineIntel; then
+  echo; echo "=== 收集 emon 数据 ==="
+  . /opt/intel/sep/sep_vars.sh
+  core=${CPU0}
+  emon -collect-edp -f "emon-${BenchName}.dat" &
+  taskset -c ${core} ./"${BenchCmd}" "${GPU_NUM}" "${BenchName}" "${BenchArgs[@]}"
+  emon -stop
 fi
 
-# collect nsys data
-echo ""
-echo "-----------------------------------------"
-echo "set CPU${cpu_array[0]} frequency to $minfreq, and collect nsys data"
-cpupower frequency-set -d $minfreq > /dev/null 2>&1
-cpupower frequency-set -u $minfreq > /dev/null 2>&1
 
-/usr/local/cuda/bin/nsys profile --trace=cuda,nvtx,osrt --sample=none --force-overwrite true -o "nsys-kernel-launch-freq-$minfreq" \
-    --stats=true taskset -c ${cpu_array[0]} ../build/kernel_launch_overhead -i 10 -n 100000
-echo ""
-echo "-----------------------------------------"
-echo "Set CPU${cpu_array[0]} frequency to $maxfreq, and collect nsys data"
-cpupower frequency-set -d $maxfreq > /dev/null 2>&1
-cpupower frequency-set -u $maxfreq > /dev/null 2>&1
+echo; echo "=== 收集 NSYS 数据 ==="
+for freq in "${minfreq}" "${maxfreq}"; do
+cpupower frequency-set -d "${freq}" -u "${freq}" >/dev/null 2>&1
+/usr/local/cuda/bin/nsys profile \
+    --trace=cuda,nvtx,osrt --sample=none --force-overwrite true \
+    -o "${RESULT_DIR}/nsys-${BenchName}-freq${freq}" --stats=true \
+    taskset -c ${CPU0} ./"${BenchCmd}" "${GPU_NUM}" "${BenchName}" "${BenchArgs[@]}"
+done
 
-/usr/local/cuda/bin/nsys profile --trace=cuda,nvtx,osrt --sample=none --force-overwrite true -o "nsys-kernel-launch-freq-$maxfreq" \
-    --stats=true taskset -c ${cpu_array[0]} ../build/kernel_launch_overhead -i 10 -n 100000
-
-cpupower frequency-set -d $minfreq > /dev/null 2>&1
-cpupower frequency-set -u $maxfreq > /dev/null 2>&1
-
-cpupower idle-set -E
-echo ""
-echo "Done"
-echo ""
-#OUTPUTFILE=kernel-launch-`hostname`-`date +%Y%m%d_%H%M`.zip
-#zip -r dot_product-$OUTPUTFILE.zip *
+cd "${WKDIR}"
+echo
+echo "All done. 结果保存在 ${RESULT_DIR}"
