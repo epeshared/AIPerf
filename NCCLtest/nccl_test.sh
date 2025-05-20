@@ -84,7 +84,7 @@ run_test() {
     >> "$OUTFILE"
 }
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES="0,1"
 #export CUDA_VISIBLE_DEIVCES="0,1,2,3"
 
 # 8. 按用户指定的列表依次跑
